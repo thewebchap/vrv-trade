@@ -1,0 +1,15 @@
+.venv/
+__pycache__/
+*.pyc
+.DS_Store
+.tradepilot_cache/
+output/
+.pytest_cache/
+Documents/
+# trade storage (real trade documents), Outlook credentials and state: never commit
+trade/
+.env
+.token_cache.json
+tradepilot.db
+*.db
+*.db-journal

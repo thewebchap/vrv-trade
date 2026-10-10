@@ -1,0 +1,9 @@
+pymupdf>=1.24
+numpy>=1.26
+openpyxl>=3.1
+requests>=2.31
+ocrmac>=1.0; sys_platform == "darwin"
+pytest>=8
+# Outlook email mode only (not needed for local verification)
+msal>=1.28
+httpx>=0.27
