@@ -1242,7 +1242,7 @@ def check_shipment_date(ctx: Ctx, ref: str) -> CheckResult:
     return _result("SHIP.DATE", title, ref, "CONDITIONAL", worst(results), " | ".join(reasons), evidence)
 
 
-INCOTERM_RX = r"\b(EXW|FCA|FAS|FOB|CFR|CNF|C\s*&\s*F|CIF|CPT|CIP|DAP|DPU|DDP)\b"
+INCOTERM_RX = r"\b(EXW|FCA|FAS|FOB|CFR|CNF|C\s*&\s*F|C\s+AND\s+F|C\s*\+\s*F|CIF|CPT|CIP|DAP|DPU|DDP)\b"
 # A delivery-term LABEL makes the term on the same line operative.
 DELIVERY_LABEL = re.compile(r"DELIVERY\s*TERMS?|TERMS?\s*OF\s*DELIVERY|\bINCOTERMS?\b(?!\s*20\d\d)|"
                             r"SHIPMENT\s*TERMS?|PRICE\s*BASIS|\bDELIVERY\s*:")
@@ -1258,9 +1258,11 @@ def incoterm_statements(doc: Document | None) -> dict:
     secondary  another line carrying exactly one Incoterm ("Port of Destination : CIF Nhava Sheva")
     ignored    explanatory/template text ("... Incoterms 2020 rule ... (for example, FOB, CFR or CIF)")
     The operative term comes from primary statements; secondary ones are used only when there is no
-    primary statement. A CONFLICT exists only when two primary statements in the same document differ.
+    primary statement. Statements are compared by Incoterm CODE: "CIF Chennai" and "CIF Chennai Port"
+    are the same term. A CONFLICT exists only when two primary statements carry different codes.
     Pages' alternative OCR passes are consulted when the primary text states nothing."""
-    out = {"term": None, "status": "NONE", "primary": [], "secondary": [], "ignored": [], "label_without_value": []}
+    out = {"term": None, "named_place": None, "raw": None, "status": "NONE", "primary": [], "secondary": [],
+           "ignored": [], "label_without_value": []}
     if not doc:
         return out
 
@@ -1268,8 +1270,8 @@ def incoterm_statements(doc: Document | None) -> dict:
         for pg, text, ocr in texts:
             for line in text.splitlines():
                 u = line.upper()
-                found = [N.norm_incoterm(m.group(0)) for m in re.finditer(INCOTERM_RX, u)]
-                found = [f for f in found if f]
+                matches = [m for m in re.finditer(INCOTERM_RX, u) if N.norm_incoterm(m.group(0))]
+                found = [N.norm_incoterm(m.group(0)) for m in matches]
                 label = DELIVERY_LABEL.search(u)
                 if not found:
                     if label and ocr:   # an empty field on an OCR'd page may be unreadable; in PDF text it is blank
@@ -1278,24 +1280,27 @@ def incoterm_statements(doc: Document | None) -> dict:
                 st = {"page": pg, "document": doc.filename, "source_text": N.norm_space(line)}
                 if NON_OPERATIVE.search(u) or len(set(found)) > 1:
                     out["ignored"].append(st | {"terms": sorted(set(found)), "why": "explanatory / example / list text"})
-                elif label and re.search(INCOTERM_RX, u[label.start():]):
-                    out["primary"].append(st | {"term": found[0]})
                 else:
-                    out["secondary"].append(st | {"term": found[0]})
+                    segment = N.PLACE_END.split(N.norm_space(line[matches[0].start():]))[0].strip(" ,.:")
+                    term = N.parse_delivery_term(segment)
+                    st |= {"term": found[0], "raw_term": term["raw"], "named_place": term["named_place"]}
+                    if label and re.search(INCOTERM_RX, u[label.start():]):
+                        out["primary"].append(st)
+                    else:
+                        out["secondary"].append(st)
 
     scan([(p.number, p.text, p.method == "ocr") for p in doc.pages])
     if not out["primary"] and not out["secondary"]:
         scan([(p.number, alt, True) for p in doc.pages for alt in p.alt_texts])
-    prim = {s["term"] for s in out["primary"]}
-    sec = {s["term"] for s in out["secondary"]}
-    if len(prim) == 1:
-        out["term"], out["status"] = prim.pop(), "DETERMINED"
-    elif len(prim) > 1:
-        out["status"] = "CONFLICT"
-    elif len(sec) == 1:
-        out["term"], out["status"] = sec.pop(), "DETERMINED"
-    elif len(sec) > 1:
-        out["status"] = "CONFLICT"
+    for group in (out["primary"], out["secondary"]):
+        codes = {s["term"] for s in group}
+        if len(codes) == 1:
+            first = group[0]
+            out.update(term=first["term"], raw=first["raw_term"], named_place=first["named_place"], status="DETERMINED")
+            break
+        if len(codes) > 1:
+            out["status"] = "CONFLICT"
+            break
     return out
 
 
@@ -1313,7 +1318,8 @@ def check_incoterms(ctx: Ctx, ref: str) -> CheckResult:
         c, i = incoterm_statements(cd), incoterm_statements(idoc)
         for st in c["primary"] + c["secondary"] + i["primary"] + i["secondary"]:
             evidence.append({"role": f"{leg} delivery term", "document": st["document"], "page": st["page"],
-                             "source_text": st["source_text"], "raw_value": st["term"],
+                             "source_text": st["source_text"], "raw_value": st["raw_term"],
+                             "normalized_value": st["term"], "incoterm": st["term"], "named_place": st["named_place"],
                              "note": "operative (labelled)" if st in c["primary"] + i["primary"] else "secondary mention",
                              "scope": leg})
         for st in c["ignored"] + i["ignored"]:
@@ -1336,14 +1342,19 @@ def check_incoterms(ctx: Ctx, ref: str) -> CheckResult:
             else:
                 r, why = PASS_NOTE, f"{cd.short} {c['term']}; {idoc.short} does not state a delivery term"
         elif c["term"] == i["term"]:
-            r, why = PASS, f"{cd.short} {c['term']} = {idoc.short} {i['term']}"
+            r, why = PASS, f"{cd.short} {c['term']} ('{c['raw']}') = {idoc.short} {i['term']} ('{i['raw']}')"
         else:
-            r, why = MISMATCH, f"{cd.short} {c['term']} but {idoc.short} {i['term']} (same {name.lower()} leg)"
+            r, why = MISMATCH, (f"{cd.short} {c['term']} ('{c['raw']}') but {idoc.short} {i['term']} ('{i['raw']}'): "
+                                f"different Incoterms in the same {name.lower()} leg")
         results.append(r)
         reasons.append(f"[{leg}] {why}")
         comps.append({"scope": leg, "a": f"{cd.short} delivery term", "a_value": c["term"],
+                      "a_raw": c["raw"], "a_named_place": c["named_place"],
                       "b": f"{idoc.short} delivery term", "b_value": i["term"],
+                      "b_raw": i["raw"], "b_named_place": i["named_place"],
                       "outcome": {PASS: "EQ", MISMATCH: "NEQ"}.get(r, "NOT_COMPARED"), "detail": why, "result": r})
+    reasons.append("Compared on the Incoterm code; the named place/port after it is delivery-location information "
+                   "and is not part of this check")
     reasons.append("Purchase and sales delivery terms are independent commercial legs and are not compared with each other")
     return _result("TERMS.INCOTERM", title, ref, "NORMALIZED", worst(results), " | ".join(reasons), evidence, comps)
 

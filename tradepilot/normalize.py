@@ -248,13 +248,40 @@ def norm_currency(s: str | None) -> str | None:
 INCOTERMS = ["EXW", "FCA", "FAS", "FOB", "CFR", "CIF", "CPT", "CIP", "DAP", "DPU", "DDP"]
 
 
+CFR_ALIASES = re.compile(r"(?<![A-Z0-9])(?:CNF|C\s*&\s*F|C\s+AND\s+F|C\s*\+\s*F)(?![A-Z0-9])", re.I)
+INCOTERM_CODE = re.compile(r"(?<![A-Z0-9])(" + "|".join(INCOTERMS) + r")(?![A-Z0-9])")
+INCOTERMS_EDITION = re.compile(r"\(?\s*\bINCOTERMS?\b\s*®?\s*(?:20\d\d)?\s*\)?", re.I)
+# Words that start the next field when a delivery term shares a line with other data.
+PLACE_END = re.compile(r"\s+(?:PAYMENT|PORT\s+OF|SHIPMENT|PRICE|QUANTITY|TOTAL|AMOUNT|VESSEL|INSURANCE|PARTIAL|"
+                        r"DATE|INVOICE|CONTRACT|HS\s*CODE)\b|[;|]", re.I)
+
+
+def parse_delivery_term(s: str | None) -> dict:
+    """A delivery term split into its Incoterm code and the named place that follows it.
+
+        "CIF"               -> {"incoterm": "CIF", "named_place": None}
+        "CIF Chennai Port"  -> {"incoterm": "CIF", "named_place": "Chennai Port"}
+        "C & F Chennai"     -> {"incoterm": "CFR", "named_place": "Chennai"}
+    The place is delivery-location information; it never changes the Incoterm. Text naming two different
+    Incoterms ("CIF/CFR Chennai") has no single code, so incoterm is None. "raw" keeps the original text."""
+    raw = norm_space(s or "") or None
+    out = {"incoterm": None, "named_place": None, "raw": raw}
+    if not raw:
+        return out
+    t = INCOTERMS_EDITION.sub(" ", CFR_ALIASES.sub("CFR", raw))
+    hits = list(INCOTERM_CODE.finditer(t.upper()))
+    if len({m.group(1) for m in hits}) != 1:
+        return out
+    out["incoterm"] = hits[0].group(1)
+    place = PLACE_END.split(t[hits[0].end():])[0]
+    place = re.sub(r"^[\s,:\-–/.]+|[\s,:\-–/.]+$", "", place)
+    out["named_place"] = norm_space(place) or None
+    return out
+
+
 def norm_incoterm(s: str | None) -> str | None:
-    if not s:
-        return None
-    u = s.upper()
-    u = re.sub(r"\b(CNF|C&F|C AND F|C\+F)\b", "CFR", u)
-    found = [t for t in INCOTERMS if re.search(rf"\b{t}\b", u)]
-    return found[0] if len(found) == 1 else None
+    """The Incoterm code only (CFR for CNF / C&F); None when absent or ambiguous."""
+    return parse_delivery_term(s)["incoterm"]
 
 
 def norm_place(s: str | None) -> str:
